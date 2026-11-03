@@ -1,0 +1,5 @@
+Metadata-Version: 2.4
+Name: agentguard
+Version: 0.1.0
+Summary: Policy-enforcement proxy between coding agents and their tools
+Requires-Python: >=3.11

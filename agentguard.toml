@@ -1,0 +1,17 @@
+[general]
+workspace = "."          # directory the agent is allowed to touch
+on_ask = "prompt"        # prompt | deny | allow
+taint_ttl_seconds = 1800
+
+[tools]                  # fnmatch patterns on MCP tool names; deny > ask > allow
+allow = ["read_*", "list_*", "get_*", "search_*"]
+ask = ["write_*", "edit_*", "create_*", "delete_*", "*send*", "*post*", "*upload*"]
+deny = []
+default = "ask"          # for tools matching nothing above
+trusted_results = []     # tools whose output does NOT taint the session
+
+[network]
+allowed_hosts = ["github.com", "pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
+
+[paths]
+allowed_outside_workspace = ["/tmp", "/dev/null", "/usr", "/bin"]
