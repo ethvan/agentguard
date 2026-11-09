@@ -15,3 +15,13 @@ allowed_hosts = ["github.com", "pypi.org", "files.pythonhosted.org", "registry.n
 
 [paths]
 allowed_outside_workspace = ["/tmp", "/dev/null", "/usr", "/bin"]
+
+# Optional per-tool argument rules. Table name is an fnmatch pattern on the tool name.
+#   allowed        = argument names the tool may receive (others -> ask)
+#   required       = argument names that must be present (missing -> ask)
+#   max_length     = per-argument max string length (longer -> ask; stops bulk exfiltration)
+#   deny_patterns  = regexes; any string argument matching -> block
+# [args."send_email"]
+# allowed = ["to", "subject", "body"]
+# max_length = { body = 2000 }
+# deny_patterns = ["(?i)password"]

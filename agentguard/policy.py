@@ -19,6 +19,7 @@ from typing import Callable, Optional
 from . import secrets
 from .models import Decision, Finding, SessionContext, ToolCall, Verdict, strictest
 from .shellparse import ShellAnalysis, analyze
+from .taskjudge import heuristic_task_judge
 
 EGRESS_TOOL = re.compile(r"(?i)(send|post|upload|http|fetch|email|webhook|publish|comment|push|request)")
 
@@ -40,6 +41,16 @@ allowed_hosts = ["github.com", "pypi.org", "files.pythonhosted.org", "registry.n
 
 [paths]
 allowed_outside_workspace = ["/tmp", "/dev/null", "/usr", "/bin"]
+
+# Optional per-tool argument rules. Table name is an fnmatch pattern on the tool name.
+#   allowed        = argument names the tool may receive (others -> ask)
+#   required       = argument names that must be present (missing -> ask)
+#   max_length     = per-argument max string length (longer -> ask; stops bulk exfiltration)
+#   deny_patterns  = regexes; any string argument matching -> block
+# [args."send_email"]
+# allowed = ["to", "subject", "body"]
+# max_length = { body = 2000 }
+# deny_patterns = ["(?i)password"]
 '''
 
 
@@ -55,6 +66,7 @@ class PolicyConfig:
     trusted_results: list[str] = field(default_factory=list)
     allowed_hosts: list[str] = field(default_factory=lambda: ["github.com", "pypi.org", "files.pythonhosted.org", "registry.npmjs.org"])
     allowed_paths: list[str] = field(default_factory=lambda: ["/tmp", "/dev/null", "/usr", "/bin"])
+    arg_rules: dict[str, dict] = field(default_factory=dict)     # fnmatch tool pattern -> rule (see _check_args)
 
 
 def load_config(path: Optional[Path]) -> PolicyConfig:
@@ -73,6 +85,7 @@ def load_config(path: Optional[Path]) -> PolicyConfig:
     cfg.trusted_results = t.get("trusted_results", [])
     cfg.allowed_hosts = n.get("allowed_hosts", cfg.allowed_hosts)
     cfg.allowed_paths = p.get("allowed_outside_workspace", cfg.allowed_paths)
+    cfg.arg_rules = data.get("args", {})
     return cfg
 
 
@@ -90,8 +103,10 @@ TaskJudge = Callable[[ToolCall, str], Optional[Finding]]
 
 class PolicyEngine:
     def __init__(self, cfg: PolicyConfig, ctx: SessionContext, task_judge: TaskJudge | None = None):
-        self.cfg, self.ctx, self.task_judge = cfg, ctx, task_judge
+        self.cfg, self.ctx = cfg, ctx
+        self.task_judge = task_judge or heuristic_task_judge
         self.workspace = Path(os.path.realpath(cfg.workspace))
+        self.env = secrets.EnvSecrets(self.workspace)
 
     # ---- public -------------------------------------------------------
     def evaluate(self, call: ToolCall) -> Decision:
@@ -117,12 +132,41 @@ class PolicyEngine:
             return [Finding("shell", v, r) for v, r in analysis.findings]
         if _match(call.tool, self.cfg.deny):
             return [Finding("permission", Verdict.BLOCK, f"tool '{call.tool}' is denied by policy")]
+        out: list[Finding] = []
         if _match(call.tool, self.cfg.ask):
-            return [Finding("permission", Verdict.ASK, f"tool '{call.tool}' needs approval")]
-        if _match(call.tool, self.cfg.allow):
-            return []
-        v = Verdict(self.cfg.default)
-        return [Finding("permission", v, f"tool '{call.tool}' is not in the allow list")] if v != Verdict.ALLOW else []
+            out.append(Finding("permission", Verdict.ASK, f"tool '{call.tool}' needs approval"))
+        elif not _match(call.tool, self.cfg.allow):
+            v = Verdict(self.cfg.default)
+            if v != Verdict.ALLOW:
+                out.append(Finding("permission", v, f"tool '{call.tool}' is not in the allow list"))
+        return out + self._check_args(call)
+
+    def _check_args(self, call) -> list[Finding]:
+        """Per-tool argument rules from [args.<pattern>] (a poor man's schema)."""
+        out: list[Finding] = []
+        args = call.arguments if isinstance(call.arguments, dict) else {}
+        for pattern, rule in self.cfg.arg_rules.items():
+            if not fnmatch(call.tool, pattern):
+                continue
+            if "allowed" in rule:
+                extra = sorted(set(args) - set(rule["allowed"]))
+                if extra:
+                    out.append(Finding("schema", Verdict.ASK, f"unexpected argument(s) for {call.tool}: {', '.join(extra)}"))
+            missing = [k for k in rule.get("required", []) if k not in args]
+            if missing:
+                out.append(Finding("schema", Verdict.ASK, f"missing required argument(s): {', '.join(missing)}"))
+            for k, limit in (rule.get("max_length") or {}).items():
+                v = args.get(k)
+                if isinstance(v, str) and len(v) > int(limit):
+                    out.append(Finding("schema", Verdict.ASK, f"argument '{k}' is {len(v)} chars (limit {limit})"))
+            for pat in rule.get("deny_patterns", []):
+                try:
+                    rx = re.compile(pat)
+                except re.error:
+                    continue
+                if any(rx.search(x) for x in secrets.iter_strings(args)):
+                    out.append(Finding("schema", Verdict.BLOCK, f"argument matches denied pattern {pat!r}"))
+        return out
 
     def _check_task_fit(self, call, analysis) -> list[Finding]:
         out: list[Finding] = []
@@ -144,11 +188,17 @@ class PolicyEngine:
     def _check_egress(self, call, analysis) -> list[Finding]:
         out: list[Finding] = []
         egress = analysis.has_network if analysis else bool(EGRESS_TOOL.search(call.tool))
-        hits = secrets.scan(call.arguments)
+        hits = secrets.scan(call.arguments, self.env.values())
         if hits:
             kinds = ", ".join(sorted({h.kind for h in hits}))
-            out.append(Finding("egress", Verdict.BLOCK if egress else Verdict.ASK,
-                               f"secret material in arguments ({kinds})"))
+            # Known formats and literal .env values are near-certain: block on egress. Entropy alone is a
+            # guess (hashes, IDs, minified blobs), so it only ever asks.
+            sure = any(h.kind != "high_entropy" for h in hits)
+            v = Verdict.BLOCK if (egress and sure) else Verdict.ASK
+            if not egress and not sure:
+                v = None
+            if v is not None:
+                out.append(Finding("egress", v, f"secret material in arguments ({kinds})"))
         if analysis:
             if analysis.has_network and analysis.has_sensitive_read:
                 out.append(Finding("egress", Verdict.BLOCK, "reads credentials and uses the network in one command"))

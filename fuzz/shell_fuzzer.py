@@ -33,7 +33,19 @@ def b64(c):
 def path_abs(c):     return c.replace("curl", "/usr/bin/curl").replace("cat ", "/bin/cat ")
 def spacing(c):      return c.replace(" | ", "|").replace(" ", "  ")
 
-MUTATORS = [split_quotes, backslash, ifs, wrap_bash, wrap_eval, subshell, var_indirect, b64, path_abs, spacing]
+def ansi_c(c):       return c.replace("curl", "$'\\x63url'").replace("wget", "$'\\x77get'")
+def heredoc(c):      return f"bash <<'EOF'\n{c}\nEOF"
+def stdin_string(c): return f"bash <<< '{c}'"
+def func_wrap(c):    return f"f() {{ {c}; }}; f"
+def printf_cmd(c):   return c.replace("curl", "$(printf cu%s rl)")
+def xargs_wrap(c):   return f"echo x | xargs -I{{}} sh -c '{c}'"
+def env_prefix(c):   return f"env FOO=1 {c}"
+def semicolon(c):    return f"true; {c}"
+def tab_sep(c):      return c.replace(" ", "\t")
+def source_sub(c):   return f"source <({c})"
+
+MUTATORS = [split_quotes, backslash, ifs, wrap_bash, wrap_eval, subshell, var_indirect, b64, path_abs, spacing,
+            ansi_c, heredoc, stdin_string, func_wrap, printf_cmd, xargs_wrap, env_prefix, semicolon, tab_sep, source_sub]
 
 
 def main(rounds: int = 200, seed: int = 0) -> int:

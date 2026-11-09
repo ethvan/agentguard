@@ -1,4 +1,4 @@
-"""agentguard CLI: mcp-proxy | check | logs | init | reset"""
+"""agentguard CLI: mcp-proxy | check | logs | viewer | init | reset"""
 from __future__ import annotations
 
 import argparse
@@ -43,7 +43,7 @@ def cmd_logs(a) -> int:
         print("no audit log yet:", path)
         return 0
     rows = [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
-    calls = [r for r in rows if "tool" in r]
+    calls = [r for r in rows if "final" in r]      # events (injection flags etc.) can carry a "tool" too
     for r in calls[-a.n:]:
         why = r["findings"][0]["reason"] if r["findings"] else ""
         print(f'{r["call_id"]} {r["source"]:5} {r["tool"][:24]:24} {r["final"]:5} {why}')
@@ -52,6 +52,21 @@ def cmd_logs(a) -> int:
     prompts = sum(1 for r in calls if r["policy_verdict"] == "ask")
     print(f"\n{len(calls)} calls | allow {c['allow']} block {c['block']} | prompts {prompts} "
           f"| median policy latency {lat[len(lat)//2]:.2f} ms")
+    return 0
+
+
+def cmd_viewer(a) -> int:
+    from . import viewer
+    src = Path(a.log) if a.log else build_runtime(a.config).auditor.path
+    if not src.exists():
+        print("no audit log yet:", src)
+        return 1
+    out = Path(a.output)
+    n = viewer.write(src, out)
+    print(f"wrote {out} ({n} decisions)")
+    if a.open:
+        import webbrowser
+        webbrowser.open(out.resolve().as_uri())
     return 0
 
 
@@ -92,6 +107,11 @@ def main(argv=None) -> int:
     p = sub.add_parser("logs", help="show recent decisions and summary")
     p.add_argument("-n", type=int, default=20)
     p.set_defaults(fn=cmd_logs)
+    p = sub.add_parser("viewer", help="render the audit log as a static HTML page")
+    p.add_argument("-o", "--output", default="agentguard-log.html")
+    p.add_argument("--log", help="audit.jsonl to read (default: this workspace's)")
+    p.add_argument("--open", action="store_true", help="open in the browser")
+    p.set_defaults(fn=cmd_viewer)
     sub.add_parser("init", help="write a starter agentguard.toml").set_defaults(fn=cmd_init)
     sub.add_parser("reset", help="clear taint state").set_defaults(fn=cmd_reset)
 

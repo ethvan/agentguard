@@ -20,6 +20,8 @@ NETWORK_CMDS = {"curl", "wget", "nc", "ncat", "netcat", "socat", "scp", "sftp",
 INTERPRETERS = {"python", "python3", "node", "ruby", "perl", "php"}
 PRIVILEGE = {"sudo", "su", "doas"}
 WRAPPERS = {"env", "command", "nohup", "time", "exec", "nice", "xargs"}
+INSTALLERS = {"pip", "pip3", "npm", "yarn", "pnpm", "cargo", "gem", "go", "uv", "poetry"}
+INSTALL_VERBS = {"install", "add", "i", "get"}
 INLINE_NET = re.compile(r"urllib|requests\.|socket|http\.client|fetch\(|XMLHttpRequest|net\.connect|https?://")
 URL_HOST = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:[^/@\s]+@)?([^/:\s]+)")
 
@@ -32,6 +34,7 @@ class ShellAnalysis:
     commands: list[str] = field(default_factory=list)
     has_network: bool = False
     has_sensitive_read: bool = False
+    installs: bool = False             # installs a named package (supply-chain risk after untrusted content)
 
     def add(self, verdict: Verdict, reason: str) -> None:
         self.findings.append((verdict, reason))
@@ -43,10 +46,25 @@ class ShellAnalysis:
         self.commands += o.commands
         self.has_network |= o.has_network
         self.has_sensitive_read |= o.has_sensitive_read
+        self.installs |= o.installs
 
     @property
     def risky(self) -> bool:
-        return bool(self.findings) or self.has_network or self.has_sensitive_read
+        return bool(self.findings) or self.has_network or self.has_sensitive_read or self.installs
+
+
+def _substitutions(cmd: str) -> list[str]:
+    """Bodies of $(...), <(...), >(...) (balanced, so nesting works) and `...`."""
+    out: list[str] = []
+    for m in re.finditer(r"`([^`]*)`", cmd):
+        out.append(m.group(1))
+    for m in re.finditer(r"(?:\$|<|>)\(", cmd):
+        depth, i = 1, m.end()
+        while i < len(cmd) and depth:
+            depth += {"(": 1, ")": -1}.get(cmd[i], 0)
+            i += 1
+        out.append(cmd[m.end():i - 1] if depth == 0 else cmd[m.end():])
+    return out
 
 
 def split_segments(cmd: str) -> list[tuple[str, str]]:
@@ -97,7 +115,9 @@ def split_segments(cmd: str) -> list[tuple[str, str]]:
 
 def _strip_prefix(argv: list[str]) -> list[str]:
     while argv:
-        if re.match(r"^[A-Za-z_]\w*=", argv[0]):
+        if argv[0] in {"{", "(", "!", "then", "do", "else"}:
+            argv = argv[1:]
+        elif re.match(r"^[A-Za-z_]\w*=", argv[0]):
             argv = argv[1:]
         elif os.path.basename(argv[0]) in WRAPPERS:
             w = os.path.basename(argv[0])
@@ -127,9 +147,14 @@ def analyze(cmdline: str, depth: int = 0) -> ShellAnalysis:
         a.add(Verdict.BLOCK, "executes remote download via process substitution")
     if "${IFS" in cmdline or "$IFS" in cmdline:
         a.add(Verdict.ASK, "IFS-based obfuscation")
-    for m in re.finditer(r"\$\(([^()]*)\)|`([^`]*)`", cmdline):
-        a.merge(analyze(m.group(1) or m.group(2) or "", depth + 1))
+    if re.search(r"(?:^|[\s;&|(])(?:source|\.|bash|sh|zsh|dash|ksh)\s+<\(", cmdline):
+        a.add(Verdict.ASK, "executes the output of a process substitution")
+    # $(...), `...` and <(...) / >(...) all run their contents: analyze them as commands
+    for inner in _substitutions(cmdline):
+        a.merge(analyze(inner, depth + 1))
 
+    # function definitions and brace groups just wrap commands: `f() { cmd; }; f`, `function f { cmd; }`
+    cmdline = re.sub(r"(?:\bfunction\s+)?\b[\w.-]+\s*\(\)\s*\{|\bfunction\s+[\w.-]+\s*\{", " ", cmdline)
     prev_cmd = ""
     for op, seg in split_segments(cmdline):
         try:
@@ -169,11 +194,38 @@ def _classify(a: ShellAnalysis, cmd: str, args: list[str], argv: list[str],
     if cmd in NETWORK_CMDS or (cmd == "git" and args[:1] == ["push"]):
         a.has_network = True
 
+    sub = next((t for t in args if not t.startswith("-")), "")
+    if cmd == "python" or cmd == "python3":
+        if args[:2] == ["-m", "pip"]:
+            cmd, args = "pip", args[2:]
+            sub = next((t for t in args if not t.startswith("-")), "")
+    if cmd in INSTALLERS and sub in INSTALL_VERBS:
+        pkgs = [t for t in args[args.index(sub) + 1:] if not t.startswith("-")]
+        flags = [t for t in args if t.startswith("-")]
+        local_only = not pkgs or all(t in {".", "./"} or t.startswith(("./", "../")) for t in pkgs)
+        if any(f in {"-r", "--requirement", "-e", "--editable"} for f in flags) and local_only:
+            local_only = True
+        reqfile = any(f in {"-r", "--requirement"} for f in flags)
+        if not (local_only or reqfile):
+            a.installs = True
+        for t in args:
+            m = URL_HOST.match(t)
+            if m:
+                a.has_network = True
+                a.hosts.append(m.group(1).lower())
+                a.installs = True
+
     if op == "|" and cmd in SHELLS:
         if prev_cmd in FETCHERS:
             a.add(Verdict.BLOCK, "pipes a remote download straight into a shell")
         else:
             a.add(Verdict.ASK, "pipes data into a shell")
+
+    if cmd in SHELLS | {"source", ".", "eval"} and "<<<" in args:      # here-string: the string is a script
+        i = args.index("<<<")
+        if i + 1 < len(args):
+            a.merge(analyze(args[i + 1], depth + 1))
+        a.add(Verdict.ASK, "script fed to a shell via here-string")
 
     if cmd in SHELLS and "-c" in args:
         i = args.index("-c")

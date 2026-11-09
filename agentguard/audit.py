@@ -11,9 +11,10 @@ from .secrets import redact
 
 
 class Auditor:
-    def __init__(self, state_dir: Path, session: str):
+    def __init__(self, state_dir: Path, session: str, env_values=None):
         self.path = state_dir / "audit.jsonl"
         self.session = session
+        self._env_values = env_values or (lambda: ())
         self._lock = threading.Lock()
         state_dir.mkdir(parents=True, exist_ok=True)
 
@@ -21,7 +22,7 @@ class Auditor:
         self._write({
             "ts": time.time(), "session": self.session, "call_id": call.call_id,
             "source": call.source, "server": call.server, "tool": call.tool,
-            "arguments": redact(call.arguments),
+            "arguments": redact(call.arguments, 500, self._env_values()),
             "policy_verdict": decision.verdict.value, "final": final,
             "user_response": user_response,
             "findings": [{"check": f.check, "verdict": f.verdict.value, "reason": f.reason}

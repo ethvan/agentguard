@@ -48,4 +48,4 @@ def build_runtime(config: Optional[Path] = None, task: str = "", on_ask: Optiona
     ctx.refresh()
     engine = PolicyEngine(cfg, ctx)
     mode = on_ask or os.environ.get("AGENTGUARD_ON_ASK") or cfg.on_ask
-    return Runtime(engine, Auditor(state_dir, uuid.uuid4().hex[:8]), Approver(mode))
+    return Runtime(engine, Auditor(state_dir, uuid.uuid4().hex[:8], engine.env.values), Approver(mode))
